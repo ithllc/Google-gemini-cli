@@ -8,6 +8,7 @@
     "voiceMode": true
   },
   "general": {
-    "devtools": true
+    "devtools": true,
+    "authMethod": "openai-compatible"
   }
 }
