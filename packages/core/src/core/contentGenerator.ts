@@ -16,6 +16,7 @@ import {
 import * as os from 'node:os';
 import { createCodeAssistContentGenerator } from '../code_assist/codeAssist.js';
 import { isCloudShell } from '../ide/detect-ide.js';
+import { OpenAiContentGenerator } from './openAiContentGenerator.js';
 import type { Config } from '../config/config.js';
 import { loadApiKey } from './apiKeyCredentialStorage.js';
 
@@ -63,6 +64,7 @@ export enum AuthType {
   LEGACY_CLOUD_SHELL = 'cloud-shell',
   COMPUTE_ADC = 'compute-default-credentials',
   GATEWAY = 'gateway',
+  USE_OPENAI_COMPATIBLE = 'openai-compatible',
 }
 
 /**
@@ -74,6 +76,9 @@ export enum AuthType {
  * 3. GEMINI_API_KEY -> USE_GEMINI
  */
 export function getAuthTypeFromEnv(): AuthType | undefined {
+  if (process.env['LOCAL_LLM_BASE_URL']) {
+    return AuthType.USE_OPENAI_COMPATIBLE;
+  }
   if (process.env['GOOGLE_GENAI_USE_GCA'] === 'true') {
     return AuthType.LOGIN_WITH_GOOGLE;
   }
@@ -193,6 +198,10 @@ export async function createContentGenerator(
   sessionId?: string,
 ): Promise<ContentGenerator> {
   const generator = await (async () => {
+    if (config.authType === AuthType.USE_OPENAI_COMPATIBLE) {
+      const baseUrl = process.env['LOCAL_LLM_BASE_URL'] || 'http://192.168.1.168:4000/v1';
+      return new OpenAiContentGenerator(baseUrl, config.apiKey || 'dummy');
+    }
     if (gcConfig.fakeResponses) {
       const fakeGenerator = await FakeContentGenerator.fromFile(
         gcConfig.fakeResponses,

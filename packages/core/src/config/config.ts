@@ -1556,11 +1556,16 @@ export class Config implements McpContext, AgentLoopContext {
   }
 
   async refreshAuth(
-    authMethod: AuthType,
+    inboundAuthMethod: AuthType,
     apiKey?: string,
     baseUrl?: string,
     customHeaders?: Record<string, string>,
   ) {
+    let authMethod = inboundAuthMethod;
+    if (process.env['LOCAL_LLM_BASE_URL']) {
+      authMethod = AuthType.USE_OPENAI_COMPATIBLE;
+    }
+    
     // Reset availability service when switching auth
     this.modelAvailabilityService.reset();
 
