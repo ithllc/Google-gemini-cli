@@ -24,7 +24,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
   constructor(baseUrl: string, apiKey: string) {
     this.openai = new OpenAI({ 
       baseURL: baseUrl, 
-      apiKey: apiKey || 'dummy-local-key' 
+      apiKey: apiKey || 'dummy-local-key',
+      timeout: 300000, // Explicitly set generous timeout to accommodate recursive tool execution loops
+      maxRetries: 3
     });
   }
 
@@ -37,7 +39,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
       model: request.model || 'gemma-4-26b',
       messages: this.mapGeminiToOpenAI(request),
       temperature: request.config?.temperature,
-      max_tokens: request.config?.maxOutputTokens,
+      max_tokens: request.config?.maxOutputTokens, // Let the backend `--max-model-len` constraint handle bounds
       tools: this.scrubAndMapTools(request),
     };
 
@@ -189,7 +191,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
   }
 
   private async executeToolCall(req: GenerateContentParameters, responseMessage: any, userPromptId: string, role: string, previousMessages?: any[]): Promise<GenerateContentResponse> {
-    const messages = previousMessages || this.mapGeminiToOpenAI(req);
+    require('fs').appendFileSync('/tmp/tool_calls.log', JSON.stringify(responseMessage, null, 2) + '\n'); const messages = previousMessages || this.mapGeminiToOpenAI(req);
     messages.push(responseMessage);
 
     // Handle parallel tool calls

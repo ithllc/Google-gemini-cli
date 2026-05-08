@@ -51,6 +51,11 @@ When the LLM intends to search the web, the internal adapter translates Google S
 ### Active Code Verification (`codeExecution`)
 When the localized LLM requests Python execution, the adapter runs a localized Node.js `child_process.exec()` sandbox to evaluate generated logic dynamically and pipes standard output back into the conversation context.
 
+### Execution Limits & Runaway Generation Halting
+To accommodate the multi-step deduction inside complex tool trees without the CLI dropping the connection, internal safety limits rely on both frontend patience and backend boundaries:
+- **Frontend HTTP Timeout (120 - 300 seconds):** The OpenAI-compatible client adapter establishes a highly permissive `timeout`, giving the backend enough time to compute intermediate recursive steps and tool validations without throwing an `APIConnectionTimeoutError`. 
+- **Backend Context Boundary (`--max-model-len`):** Because deep reasoning models need variable token lengths to "think" properly, the adapter does not hardcode an explicit `max_tokens` cutoff. Instead, unbounded hallmark generation or infinite thought loops are cut by vLLM when the context window reaches the configured `--max-model-len` (e.g., 8192), ensuring generation halts gracefully and control returns to the CLI.
+
 ### Example: Tool usage in Headless Mode
 ```bash
 export LOCAL_LLM_BASE_URL="http://192.168.1.168:4000/v1"
@@ -60,5 +65,5 @@ node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js -p "Use the 
 ### Example: Tool usage in Interactive Mode
 ```bash
 export LOCAL_LLM_BASE_URL="http://192.168.1.168:4000/v1"
-node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js "Search the web for the latest NVDK releases, then write a local python script to parse the dates." --model="gemma-4-26b"
+node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js -p "Search the web for the latest NVDK releases, then write a local python script to parse the dates." --model="gemma-4-26b"
 ```
