@@ -1,3 +1,8 @@
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
 import OpenAI from 'openai';
 import type { 
   GenerateContentParameters, 
@@ -13,8 +18,8 @@ import type { LlmRole } from '../telemetry/llmRole.js';
 
 export class OpenAiContentGenerator implements ContentGenerator {
   private openai: OpenAI;
-  public userTier?: UserTierId;
-  public userTierName?: string;
+  userTier?: UserTierId;
+  userTierName?: string;
 
   constructor(baseUrl: string, apiKey: string) {
     this.openai = new OpenAI({ 
@@ -28,16 +33,27 @@ export class OpenAiContentGenerator implements ContentGenerator {
     userPromptId: string,
     role: LlmRole,
   ): Promise<GenerateContentResponse> {
-    const response = await this.openai.chat.completions.create({
+    const payload: any = {
       model: request.model || 'gemma-4-26b',
       messages: this.mapGeminiToOpenAI(request),
       temperature: request.config?.temperature,
       max_tokens: request.config?.maxOutputTokens,
-      tools: this.scrubAndMapTools(request)
-    });
+      tools: this.scrubAndMapTools(request),
+    };
+
+    // Enable "thinking" natively for agentic tasks especially when tools are populated
+    if (payload.tools && payload.tools.length > 0) {
+      payload.extra_body = {
+        chat_template_kwargs: {
+          enable_thinking: true
+        }
+      };
+    }
+
+    const response = await this.openai.chat.completions.create(payload);
     
     if (response.choices[0].message.tool_calls) {
-      return await this.executeToolCall(request, response.choices[0].message, userPromptId, role);
+      return this.executeToolCall(request, response.choices[0].message, userPromptId, role);
     }
     
     return this.mapOpenAIToGemini(response);
@@ -121,9 +137,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
   }
   
   private async interceptFunctionCall(req: any, call: any): Promise<any> {
-    const fs = require('fs');
-    const { execSync } = require('child_process');
-    const os = require('os');
+    const fs = require('node:fs');
+    const { execSync } = require('node:child_process');
+    const os = require('node:os');
     
     if (call.name === 'tavily_search') {
       const args = JSON.parse(call.arguments);
@@ -147,7 +163,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             api_key: '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',
-            query: query,
+            query,
             search_depth: "basic",
             include_answer: false,
             max_results: 3
@@ -187,7 +203,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
     
     const response = await this.openai.chat.completions.create({
       model: req.model || 'gemma-4-26b',
-      messages: messages,
+      messages,
       tools: this.scrubAndMapTools(req)
     });
     return this.mapOpenAIToGemini(response);

@@ -40,7 +40,10 @@ node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js -p "What mod
 
 ## Tool Calling: Tavily Search & Local Code Execution
 
-The custom OpenAI payload translation intercepts Google-exclusive tools and provides mapped functionality for them.
+The custom OpenAI payload translation intercepts Google-exclusive tools and provides mapped functionality for them. When tools are provided, the CLI dynamically enables "Thinking + Tool Use" mode using `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
+
+### Enabling Thinking + Tool Use
+Thinking paired with tools allows the LLM to deduce complex relationships before selecting arguments (greatly reducing hallucinations). Because it is natively injected by the adapter, you do not need to do anything manually. The LLM will output its `<|channel>thought` internal reasoning securely to vLLM, which parses and executes the matching tools cleanly.
 
 ### Web Search (`googleSearch` -> Tavily)
 When the LLM intends to search the web, the internal adapter translates Google Search requests to Tavily Search queries (`tvly-dev` endpoint) ensuring zero dependencies on Google's API keys, while strictly metering usage against `~/.gemini_cli_tavily_quota.json`.
