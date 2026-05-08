@@ -56,7 +56,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
       return this.executeToolCall(request, response.choices[0].message, userPromptId, role);
     }
     
-    return this.mapOpenAIToGemini(response);
+    require('fs').appendFileSync('/tmp/debug_resp.json', '\n\n' + JSON.stringify(response, null, 2)); return this.mapOpenAIToGemini(response);
   }
 
       async generateContentStream(
@@ -188,24 +188,43 @@ export class OpenAiContentGenerator implements ContentGenerator {
     return JSON.stringify({ error: "Unsupported tool call" });
   }
 
-  private async executeToolCall(req: GenerateContentParameters, responseMessage: any, userPromptId: string, role: string): Promise<GenerateContentResponse> {
-    const call = responseMessage.tool_calls[0];
-    const callId = call.id;
-    const callResult = await this.interceptFunctionCall(req, call.function);
-    
-    const messages = this.mapGeminiToOpenAI(req);
+  private async executeToolCall(req: GenerateContentParameters, responseMessage: any, userPromptId: string, role: string, previousMessages?: any[]): Promise<GenerateContentResponse> {
+    const messages = previousMessages || this.mapGeminiToOpenAI(req);
     messages.push(responseMessage);
-    messages.push({
-      role: "tool",
-      tool_call_id: callId,
-      content: callResult
-    });
+
+    // Handle parallel tool calls
+    if (responseMessage.tool_calls) {
+      for (const call of responseMessage.tool_calls) {
+        const callId = call.id;
+        const callResult = await this.interceptFunctionCall(req, call.function);
+        messages.push({
+          role: "tool",
+          tool_call_id: callId,
+          content: callResult
+        });
+      }
+    }
     
-    const response = await this.openai.chat.completions.create({
+    const payload: any = {
       model: req.model || 'gemma-4-26b',
       messages,
       tools: this.scrubAndMapTools(req)
-    });
+    };
+
+    if (payload.tools && payload.tools.length > 0) {
+      payload.extra_body = {
+        chat_template_kwargs: {
+          enable_thinking: true
+        }
+      };
+    }
+    
+    const response = await this.openai.chat.completions.create(payload);
+    
+    if (response.choices[0].message.tool_calls) {
+      return await this.executeToolCall(req, response.choices[0].message, userPromptId, role, messages);
+    }
+    
     return this.mapOpenAIToGemini(response);
   }
 
