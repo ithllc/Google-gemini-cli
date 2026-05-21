@@ -239,3 +239,56 @@ After recompiling the workspace via `npm run bundle`, the exact complex planning
 prompts succeeded perfectly through `gemma-4-26b`. No timeout drops occurred and
 the complete architectural breakdown successfully streamed back to the CLI in
 the terminal!
+
+## Deploying Updates to Remote Environments
+
+To ensure that both the **Infinite Recursion Fix** and the **Timeout Extension
+Fix** are active on any remote CLI machines (or alternate development
+environments) where you use the `gemini-cli` against your local LLMs, follow
+these steps to sync and rebuild the binaries.
+
+### Step-by-Step Sync and Build Instructions
+
+1. **Access the Remote CLI Machine:** SSH into your remote machine and navigate
+   to the `Google-gemini-cli` repository directory.
+
+   ```bash
+   ssh user@remote-machine
+   cd /path/to/Google-gemini-cli
+   ```
+
+2. **Pull the Latest Changes:** Fetch the updated core files and documentation
+   from the `main` branch.
+
+   ```bash
+   git pull origin main
+   ```
+
+3. **Ensure Node.js is Active:** Activate your Node Version Manager environment
+   (assuming NVM is used and Node v20+ is required by the project).
+
+   ```bash
+   export NVM_DIR="$HOME/.nvm"
+   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+   ```
+
+4. **Install Dependencies (if required):** Ensure all package dependencies are
+   up to date.
+
+   ```bash
+   npm install
+   ```
+
+5. **Recompile the Workspace:** You must rebuild the CLI bundles so the
+   `fetch.ts` timeout changes and the `openAiContentGenerator.ts` recursion
+   fixes are compiled into the operational `bundle/` directory.
+
+   ```bash
+   npm run bundle
+   ```
+
+6. **Verify the Build:** Test a complex prompt pointing to your open-source
+   model router to verify the timeouts are respected.
+   ```bash
+   node bundle/gemini.js -p "I want to build a distributed model architecture system..." --model="gemma-4-26b"
+   ```
