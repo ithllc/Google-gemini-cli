@@ -25,7 +25,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
     this.openai = new OpenAI({ 
       baseURL: baseUrl, 
       apiKey: apiKey || 'dummy-local-key',
-      timeout: 300000, // Explicitly set generous timeout to accommodate recursive tool execution loops
+      timeout: 1200000, // Explicitly set generous timeout to accommodate recursive tool execution loops
       maxRetries: 3
     });
   }
