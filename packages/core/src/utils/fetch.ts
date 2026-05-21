@@ -28,8 +28,8 @@ export class PrivateIpError extends Error {
   }
 }
 
-let defaultHeadersTimeout = 60000; // 60 seconds
-const defaultBodyTimeout = 300000; // 5 minutes
+let defaultHeadersTimeout = 1200000; // 20 minutes for local LLMs
+const defaultBodyTimeout = 1200000; // 20 minutes for local LLMs
 let currentProxy: string | undefined = undefined;
 
 // Configure default global dispatcher with higher timeouts

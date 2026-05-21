@@ -138,18 +138,104 @@ exit cleanly providing the user the converted Fahrenheit response.
 ## Resolution: Fixing Infinite Recursion and Tool Bleeding with Local LLMs
 
 ### Problem
-When running the Gemini CLI against local vLLM/LiteLLM engines using OpenAI compatibility, the proxy encountered infinite recursion loops. This caused the CLI to hang. Issues included missing tool schema definitions, unhandled `finish_reason`s dropping tool triggers, and python execution strings breaking local bash syntax due to un-escaped line terminators.
+
+When running the Gemini CLI against local vLLM/LiteLLM engines using OpenAI
+compatibility, the proxy encountered infinite recursion loops. This caused the
+CLI to hang. Issues included missing tool schema definitions, unhandled
+`finish_reason`s dropping tool triggers, and python execution strings breaking
+local bash syntax due to un-escaped line terminators.
 
 ### Root Causes
-1. **Missing Tool Schemas:** The `google_web_search` and `execute_python_code` tools were not being mapped to the OpenAI API payload natively, preventing the local LLM from predicting them correctly.
-2. **Finish Reason Mismatch:** OpenAI's `finish_reason: "tool_calls"` was not being parsed correctly by the Gemini mapping, causing the generator to silently drop the call and re-prompt itself infinitely.
-3. **Python Execution String Escaping:** The underlying code execution hook passed stringified python code directly to `python3 -c "[code]"`, which broke when standard line breaks (`\n`) were present.
+
+1. **Missing Tool Schemas:** The `google_web_search` and `execute_python_code`
+   tools were not being mapped to the OpenAI API payload natively, preventing
+   the local LLM from predicting them correctly.
+2. **Finish Reason Mismatch:** OpenAI's `finish_reason: "tool_calls"` was not
+   being parsed correctly by the Gemini mapping, causing the generator to
+   silently drop the call and re-prompt itself infinitely.
+3. **Python Execution String Escaping:** The underlying code execution hook
+   passed stringified python code directly to `python3 -c "[code]"`, which broke
+   when standard line breaks (`\n`) were present.
 
 ### The Fix (Implemented in Core)
-1. **Schema Interception:** Updated `scrubAndMapTools()` in `openAiContentGenerator.ts` to statically push schemas for `google_web_search` and `execute_python_code`.
-2. **Tool Routing:** Internally intercepted `google_web_search` to map to `https://api.tavily.com/search` to maintain standard web search functionality locally.
-3. **Python File Execution Mitigation:** Replaced the fragile inline `execSync('python3 -c ...')` logic with a robust temporary file writer. The proxy now dumps the generated code to `os.tmpdir() + '/gemini_cli_exec_<ts>.py'`, runs `python3 <temp_file>`, captures `stdout`, and safely unlinks (deletes) the file.
-4. **Recursion Break:** Implemented a firm `depth >= 5` cutoff to break unbounded recursive loops during multi-step tool logic.
-5. **State Synchronization:** Mapped OpenAI tool call states straight into Gemini `parts[]` structure to avoid orphaned tool loops.
 
-Both Tavily web search integration and the Local Execution environment have been fully validated to support complex, multi-step chains (e.g., Search -> Write Python -> Execute) through the LiteLLM gemma-4 proxy.
+1. **Schema Interception:** Updated `scrubAndMapTools()` in
+   `openAiContentGenerator.ts` to statically push schemas for
+   `google_web_search` and `execute_python_code`.
+2. **Tool Routing:** Internally intercepted `google_web_search` to map to
+   `https://api.tavily.com/search` to maintain standard web search functionality
+   locally.
+3. **Python File Execution Mitigation:** Replaced the fragile inline
+   `execSync('python3 -c ...')` logic with a robust temporary file writer. The
+   proxy now dumps the generated code to
+   `os.tmpdir() + '/gemini_cli_exec_<ts>.py'`, runs `python3 <temp_file>`,
+   captures `stdout`, and safely unlinks (deletes) the file.
+4. **Recursion Break:** Implemented a firm `depth >= 5` cutoff to break
+   unbounded recursive loops during multi-step tool logic.
+5. **State Synchronization:** Mapped OpenAI tool call states straight into
+   Gemini `parts[]` structure to avoid orphaned tool loops.
+
+Both Tavily web search integration and the Local Execution environment have been
+fully validated to support complex, multi-step chains (e.g., Search -> Write
+Python -> Execute) through the LiteLLM gemma-4 proxy.
+
+## Secondary Issue: APIConnectionTimeoutError on Complex Prompts
+
+### The Problem
+
+After resolving the infinite tool recursion, evaluating complex architecture
+prompts (e.g. "I want to build a distributed model architecture system...")
+against local setups (vLLM routing `gemma-4-26b` -> LiteLLM -> CLI) resulted in
+a strict timeout: `APIConnectionTimeoutError: Request timed out` The failure
+occurred precisely at 4 minutes and 6 seconds into the completion span.
+Validations with direct `curl` requests verified the model engine itself
+processed and streamed successfully in roughly 2.5 minutes, demonstrating that
+the failure was strictly on the client (CLI) side severing the connection too
+early.
+
+### Diagnosing the Global Dispatcher Timeout
+
+While the underlying proxy limits (LiteLLM `request_timeout`) were already
+extended, the issue persevered within the CLI codebase itself. Running deep
+`grep` inspections revealed that the CLI relies on the `@protobufjs/fetch` or
+natively compiled `undici` mechanisms inside the `bundle/chunk-*` compiled
+workspace.
+
+Tracing the source code in `packages/core/src/utils/fetch.ts` found the exact
+root cause:
+
+```typescript
+let defaultHeadersTimeout = 60000; // 60 seconds
+const defaultBodyTimeout = 300000; // 5 minutes
+
+// Configure default global dispatcher with higher timeouts
+setGlobalDispatcher(
+  new Agent({
+    headersTimeout: defaultHeadersTimeout,
+    bodyTimeout: defaultBodyTimeout,
+  }),
+);
+```
+
+The CLI injected a global static `headersTimeout` limit of 60 seconds. When
+paired with the CLI's internal retry mechanisms (`maxRetries: 3`), the global
+dispatcher hard-closed the stream precisely at the 240-second mark (plus some
+milliseconds of connection latency), manifesting as the
+`APIConnectionTimeoutError`. Complex local open-source multi-agent chains often
+take more than 60 seconds for the "Time To First Token", resulting in premature
+termination.
+
+### The Fix
+
+To accommodate the prolonged reasoning phases of slow local edge inference, the
+global dispatch settings were manually patched in `fetch.ts`.
+
+**Changes applied:**
+
+1. Increased `defaultHeadersTimeout` from `60000` (60s) to `1200000` (20m).
+2. Increased `defaultBodyTimeout` from `300000` (5m) to `1200000` (20m).
+
+After recompiling the workspace via `npm run bundle`, the exact complex planning
+prompts succeeded perfectly through `gemma-4-26b`. No timeout drops occurred and
+the complete architectural breakdown successfully streamed back to the CLI in
+the terminal!
