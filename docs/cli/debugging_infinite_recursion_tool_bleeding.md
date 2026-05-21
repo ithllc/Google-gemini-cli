@@ -279,11 +279,11 @@ these steps to sync and rebuild the binaries.
    npm install
    ```
 
-5. **Recompile the Workspace:** You must rebuild the CLI bundles so the
-   `fetch.ts` timeout changes and the `openAiContentGenerator.ts` recursion
-   fixes are compiled into the operational `bundle/` directory.
+5. **Clear Build Caches and Recompile the Workspace:** To ensure that the inline timeout overrides applied to the OpenAI Node SDK propagate successfully and prevent stale TypeScript definitions from masking the updates (which can cause the `APIConnectionTimeoutError` dropping at the 4-minute mark), you must obliterate the build cache layer before rebuilding the CLI bundles.
 
    ```bash
+   rm -rf node_modules/.cache
+   rm -rf packages/core/dist
    npm run bundle
    ```
 

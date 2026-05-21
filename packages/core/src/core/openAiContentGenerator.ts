@@ -52,7 +52,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
       };
     }
 
-    const response = await this.openai.chat.completions.create(payload);
+    const response = await this.openai.chat.completions.create(payload, { timeout: 1200000 });
     
     if (response.choices[0].message.tool_calls) {
       return this.executeToolCall(request, response.choices[0].message, userPromptId, role);
