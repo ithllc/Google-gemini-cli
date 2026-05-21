@@ -111,3 +111,32 @@ export LOCAL_LLM_BASE_URL="http://192.168.1.168:4000/v1"
 node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js --model="gemma-4-26b"
 #-question to ask "Search the web for the latest NVDK releases, then write a local python script to parse the dates."
 ```
+
+## Switching Workspaces vs. Remote Deployments
+
+If you are simply switching to a different project directory (workspace) on the
+**same machine** where the CLI is installed, you do **not** need to rebuild,
+update, or reinstall the CLI package. The compiled bundle at
+`/llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js` contains
+everything it needs to execute globally.
+
+When opening a new terminal session in a different workspace, simply establish
+the runtime environment and call the absolute path sequentially:
+
+1. **Activate Node.js** (if using NVM):
+
+   ```bash
+   export NVM_DIR="$HOME/.nvm"
+   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+   ```
+
+2. **Set the internal LLM routing variable:**
+
+   ```bash
+   export LOCAL_LLM_BASE_URL="http://192.168.1.168:4000/v1"
+   ```
+
+3. **Execute the CLI via the absolute bundle path:**
+   ```bash
+   node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js -p "Example Question or Comment to the Local LLM" --model="gemma-4-26b"
+   ```
