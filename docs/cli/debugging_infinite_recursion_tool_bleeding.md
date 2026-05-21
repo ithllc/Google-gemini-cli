@@ -134,3 +134,22 @@ to exist on the OpenAI payload.
 sub-process locally (Node successfully trapping the Python `execSync` output),
 route that execution value back via the OpenAI `tool_message` role, and finally
 exit cleanly providing the user the converted Fahrenheit response.
+
+## Resolution: Fixing Infinite Recursion and Tool Bleeding with Local LLMs
+
+### Problem
+When running the Gemini CLI against local vLLM/LiteLLM engines using OpenAI compatibility, the proxy encountered infinite recursion loops. This caused the CLI to hang. Issues included missing tool schema definitions, unhandled `finish_reason`s dropping tool triggers, and python execution strings breaking local bash syntax due to un-escaped line terminators.
+
+### Root Causes
+1. **Missing Tool Schemas:** The `google_web_search` and `execute_python_code` tools were not being mapped to the OpenAI API payload natively, preventing the local LLM from predicting them correctly.
+2. **Finish Reason Mismatch:** OpenAI's `finish_reason: "tool_calls"` was not being parsed correctly by the Gemini mapping, causing the generator to silently drop the call and re-prompt itself infinitely.
+3. **Python Execution String Escaping:** The underlying code execution hook passed stringified python code directly to `python3 -c "[code]"`, which broke when standard line breaks (`\n`) were present.
+
+### The Fix (Implemented in Core)
+1. **Schema Interception:** Updated `scrubAndMapTools()` in `openAiContentGenerator.ts` to statically push schemas for `google_web_search` and `execute_python_code`.
+2. **Tool Routing:** Internally intercepted `google_web_search` to map to `https://api.tavily.com/search` to maintain standard web search functionality locally.
+3. **Python File Execution Mitigation:** Replaced the fragile inline `execSync('python3 -c ...')` logic with a robust temporary file writer. The proxy now dumps the generated code to `os.tmpdir() + '/gemini_cli_exec_<ts>.py'`, runs `python3 <temp_file>`, captures `stdout`, and safely unlinks (deletes) the file.
+4. **Recursion Break:** Implemented a firm `depth >= 5` cutoff to break unbounded recursive loops during multi-step tool logic.
+5. **State Synchronization:** Mapped OpenAI tool call states straight into Gemini `parts[]` structure to avoid orphaned tool loops.
+
+Both Tavily web search integration and the Local Execution environment have been fully validated to support complex, multi-step chains (e.g., Search -> Write Python -> Execute) through the LiteLLM gemma-4 proxy.
