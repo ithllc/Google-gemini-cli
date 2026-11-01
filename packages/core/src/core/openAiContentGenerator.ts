@@ -18,16 +18,58 @@ import type { LlmRole } from '../telemetry/llmRole.js';
 
 export class OpenAiContentGenerator implements ContentGenerator {
   private openai: OpenAI;
+  private baseUrl: string;
+  private modelMap: Record<string, string> = {};
+  private modelListFetched = false;
   userTier?: UserTierId;
   userTierName?: string;
 
-  constructor(baseUrl: string, apiKey: string) {
-    this.openai = new OpenAI({ 
-      baseURL: baseUrl, 
-      apiKey: apiKey || 'dummy-local-key',
+  constructor(baseUrl: string, apiKey?: string) {
+    this.baseUrl = baseUrl;
+    const opts: any = {
+      baseURL: baseUrl,
       timeout: 1200000, // Explicitly set generous timeout to accommodate recursive tool execution loops
-      maxRetries: 3
-    });
+      maxRetries: 3,
+    };
+    // Only supply an apiKey to the OpenAI client when one is explicitly provided.
+    // Avoid sending a bogus/default key which some backends treat as an invalid API key.
+    if (apiKey) {
+      opts.apiKey = apiKey;
+    }
+    this.openai = new OpenAI(opts);
+  }
+
+  private async fetchModelList(): Promise<void> {
+    if (this.modelListFetched) return;
+    this.modelListFetched = true;
+    try {
+      const url = (this.baseUrl || '').replace(/\/$/, '') + '/models';
+      const res = await fetch(url, { method: 'GET' } as any);
+      if (!res.ok) return;
+      const json = await res.json();
+      const models = Array.isArray(json) ? json : json?.models ?? [];
+      for (const m of models) {
+        const id = m.id || m.root || '';
+        if (!id) continue;
+        this.modelMap[id] = id;
+        const parts = id.split('/');
+        const short = parts[parts.length - 1];
+        if (short) this.modelMap[short] = id;
+        if (m.root) {
+          const rootBase = String(m.root).split('/').pop();
+          if (rootBase) this.modelMap[rootBase] = id;
+          this.modelMap[m.root] = id;
+        }
+      }
+    } catch (e) {
+      // ignore errors, leave modelMap empty
+    }
+  }
+
+  private async resolveModelName(name?: string): Promise<string | undefined> {
+    if (!name) return undefined;
+    await this.fetchModelList();
+    return this.modelMap[name] ?? name;
   }
 
   async generateContent(
@@ -36,8 +78,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
     role: LlmRole,
   ): Promise<GenerateContentResponse> {
     const tools = this.scrubAndMapTools(request);
+    const resolvedModel = await this.resolveModelName(request.model || 'gemma-4-26b');
     const payload: any = {
-      model: request.model || 'gemma-4-26b',
+      model: resolvedModel,
       messages: this.mapGeminiToOpenAI(request),
       temperature: request.config?.temperature,
       max_tokens: request.config?.maxOutputTokens, // Let the backend `--max-model-len` constraint handle bounds
@@ -52,7 +95,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
       };
     }
 
-    const response = await this.openai.chat.completions.create(payload, { timeout: 1200000 });
+    let response; try { response = await this.openai.chat.completions.create(payload, { timeout: 1200000 }); } catch (e: any) { require("fs").appendFileSync("/tmp/req_tools.log", "\n\nERROR: " + e.message); throw e; }
     
     if (response.choices[0].message.tool_calls) {
       return this.executeToolCall(request, response.choices[0].message, userPromptId, role);
@@ -83,83 +126,67 @@ export class OpenAiContentGenerator implements ContentGenerator {
   }
 
   private scrubAndMapTools(req: any): any[] | undefined {
-    require('fs').appendFileSync('/tmp/req_tools.log', JSON.stringify({tools: req.tools, configTools: req.config?.tools}, null, 2) + '\n');
-    if (process.env.GEMINI_DISABLE_TOOLS === "true") {
+    require('fs').appendFileSync('/tmp/req_tools.log', JSON.stringify(req, null, 2) + '\n');
+    if (process.env['GEMINI_DISABLE_TOOLS'] === "true") {
       return undefined;
     }
     const outTools: any[] = [];
+    const seenToolNames = new Set<string>();
     const inTools = req.tools || (req.config && req.config.tools) || [];
-    
+
+    const addTool = (name: string, description: string, parameters: any) => {
+      if (!name || seenToolNames.has(name)) {
+        return;
+      }
+      seenToolNames.add(name);
+      outTools.push({
+        type: "function",
+        function: {
+          name,
+          description: description || "",
+          parameters: parameters || { type: "object", properties: {} }
+        }
+      });
+    };
+
     if (Array.isArray(inTools)) {
       for (const tool of inTools) {
         if (tool.functionDeclarations) {
           for (const func of tool.functionDeclarations) {
-            if (func.name === 'google_web_search' || func.name === 'execute_python_code') continue;
-            outTools.push({
-              type: "function",
-              function: {
-                name: func.name,
-                description: func.description || "",
-                parameters: func.parametersJsonSchema || func.parameters || { type: "object", properties: {} }
-              }
-            });
+            addTool(
+              func.name,
+              func.description || "",
+              func.parametersJsonSchema || func.parameters || { type: "object", properties: {} },
+            );
           }
         }
-        outTools.push({
-          type: "function",
-          function: {
-            name: "google_web_search",
-            description: "Search the web for real-time information. Returns a JSON string of search results.",
-            parameters: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"]
-            }
-          }
-        });
-        outTools.push({
-          type: "function",
-          function: {
-            name: "execute_python_code",
-            description: "Execute python code generated by the model. Returns execution output.",
-            parameters: {
-              type: "object",
-              properties: { code: { type: "string" } },
-              required: ["code"]
-            }
-          }
-        });
+
         if (tool.googleSearch !== undefined) {
-          outTools.push({
-            type: "function",
-            function: {
-              name: "tavily_search",
-              description: "Search the web for real-time information. Returns a JSON string of search results.",
-              parameters: {
-                type: "object",
-                properties: {
-                  query: { type: "string", description: "The search query" }
-                },
-                required: ["query"]
-              }
-            }
-          });
+          addTool(
+            "google_web_search",
+            "Search the web for real-time information. Returns a JSON string of search results.",
+            {
+              type: "object",
+              properties: {
+                query: { type: "string", description: "The search query" }
+              },
+              required: ["query"]
+            },
+          );
         }
+
         if (tool.codeExecution !== undefined) {
-          outTools.push({
-            type: "function",
-            function: {
-              name: "execute_python_code",
-              description: "Execute python code generated by the model. Returns execution output.",
-              parameters: {
-                type: "object",
-                properties: {
-                  code: { type: "string", description: "The python code to execute" }
-                },
-                required: ["code"]
-              }
-            }
-          });
+          addTool(
+            "execute_python_code",
+            "Execute python code generated by the model. Returns execution output.",
+            {
+              type: "object",
+              properties: {
+                code: { type: "string", description: "The python code to execute" }
+              },
+              required: ["code"]
+            },
+          );
         }
       }
     }
@@ -223,7 +250,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
   }
 
   private async executeToolCall(req: GenerateContentParameters, responseMessage: any, userPromptId: string, role: string, previousMessages?: any[], depth: number = 0): Promise<GenerateContentResponse> {
-    if (depth >= 5) {
+    if (depth >= 15) {
       return this.mapOpenAIToGemini({
         choices: [{
           message: { content: "I've reached the maximum number of tool execution steps." },
@@ -271,8 +298,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
     }
     
     const tools = this.scrubAndMapTools(req);
+    const resolvedModel = await this.resolveModelName(req.model || 'gemma-4-26b');
     const payload: any = {
-      model: req.model || 'gemma-4-26b',
+      model: resolvedModel,
       messages
     };
 
@@ -285,7 +313,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
       };
     }
     
-    const response = await this.openai.chat.completions.create(payload);
+    let response; try { response = await this.openai.chat.completions.create(payload, { timeout: 1200000 }); } catch (e: any) { require("fs").appendFileSync("/tmp/req_tools.log", "\n\nERROR INNER: " + e.message); throw e; }
     
     if (response.choices[0].message.tool_calls) {
       return await this.executeToolCall(req, response.choices[0].message, userPromptId, role, messages, depth + 1);
@@ -303,44 +331,39 @@ export class OpenAiContentGenerator implements ContentGenerator {
     const contentsArray = Array.isArray(req.contents) ? req.contents : (req.contents ? [req.contents] : []);
     for (const c of contentsArray) {
       const anyC = c as any;
-      if (anyC.role === 'function') {
-        const parts = Array.isArray(anyC.parts) ? anyC.parts : [];
-        for (const p of parts) {
-          if (p.functionResponse) {
-             messages.push({
-               role: 'tool',
-               tool_call_id: p.functionResponse.name + "_id",
-               name: p.functionResponse.name,
-               content: JSON.stringify(p.functionResponse.response)
-             });
-          }
+      const parts = Array.isArray(anyC.parts) ? anyC.parts : [];
+      
+      const fnResponses = parts.filter((p: any) => !!p.functionResponse);
+      const fnCalls = parts.filter((p: any) => !!p.functionCall);
+      const textParts = parts.filter((p: any) => p.text).map((p: any) => p.text).join('\n');
+      
+      if (fnResponses.length > 0) {
+        for (const p of fnResponses) {
+           messages.push({
+             role: 'tool',
+             tool_call_id: p.functionResponse.id || (p.functionResponse.name + "_id"),
+             name: p.functionResponse.name,
+             content: typeof p.functionResponse.response === 'string' ? p.functionResponse.response : JSON.stringify(p.functionResponse.response)
+           });
         }
-      } else {
-        const parts = Array.isArray(anyC.parts) ? anyC.parts : [];
-        const textParts = parts.filter(p => p.text).map(p => p.text).join('\n');
-        
+      } 
+      
+      if (textParts || fnCalls.length > 0) {
         let msg: any = {
-          role: anyC.role === 'model' ? 'assistant' : anyC.role,
+          role: anyC.role === 'model' ? 'assistant' : 'user',
         };
         if (textParts) msg.content = textParts;
         
-        let tool_calls = [];
-        for (const p of parts) {
-          if (p.functionCall) {
-            tool_calls.push({
-              id: p.functionCall.name + "_id",
-              type: "function",
-              function: {
-                 name: p.functionCall.name,
-                 arguments: JSON.stringify(p.functionCall.args)
-              }
-            });
-          }
+        if (fnCalls.length > 0) {
+          msg.tool_calls = fnCalls.map((p: any) => ({
+            id: p.functionCall.id || (p.functionCall.name + "_id"),
+            type: "function",
+            function: {
+               name: p.functionCall.name,
+               arguments: typeof p.functionCall.args === 'string' ? p.functionCall.args : JSON.stringify(p.functionCall.args)
+            }
+          }));
         }
-        if (tool_calls.length > 0) {
-           msg.tool_calls = tool_calls;
-        }
-        
         messages.push(msg);
       }
     }
@@ -368,27 +391,27 @@ export class OpenAiContentGenerator implements ContentGenerator {
       parts.push({ text: "" });
     }
     
-    require('fs').appendFileSync('/tmp/gemini_mapped_response.log', JSON.stringify({
+    
+    const mappedResp = {
       candidates: [{
         content: { parts: parts, role: 'model' },
-        finishReason: resp.choices[0].finish_reason === 'tool_calls' ? 'STOP' : resp.choices[0].finish_reason,
+        finishReason: parts.some(p => p.functionCall) ? undefined : (resp.choices[0].finish_reason === "tool_calls" ? "STOP" : resp.choices[0].finish_reason)
       }],
+      functionCalls: parts.filter(p => p.functionCall).map(p => {
+        const fc = p.functionCall;
+        return {
+           id: "synth_mapped_" + Date.now() + "_" + Math.random().toString(36).substr(2, 5),
+           name: fc.name,
+           args: fc.args
+        };
+      }),
       usageMetadata: {
         promptTokenCount: resp.usage?.prompt_tokens,
         candidatesTokenCount: resp.usage?.completion_tokens,
         totalTokenCount: resp.usage?.total_tokens
       }
-    }, null, 2) + '\n');
-    return {
-      candidates: [{
-        content: { parts: parts, role: 'model' },
-        finishReason: resp.choices[0].finish_reason,
-      }],
-      usageMetadata: {
-        promptTokenCount: resp.usage?.prompt_tokens,
-        candidatesTokenCount: resp.usage?.completion_tokens,
-        totalTokenCount: resp.usage?.total_tokens
-      }
-    } as GenerateContentResponse;
+    };
+    require('fs').appendFileSync('/tmp/gemini_mapped_response.log', JSON.stringify(mappedResp, null, 2) + '\n');
+    return mappedResp as GenerateContentResponse;
   }
 }
