@@ -140,6 +140,20 @@ describe('bounded local adapter', () => {
     ).rejects.toThrow(reason);
     expect(create).not.toHaveBeenCalled();
   });
+  it('counts the same optional nonthinking template that it sends', async () => {
+    const { g, create, fetcher } = setup();
+    vi.stubEnv('LOCAL_LLM_DISABLE_THINKING', 'true');
+    await g.generateContent({ model, contents: 'task' }, 'p', LlmRole.MAIN);
+    expect(create.mock.calls[0][0]).toMatchObject({
+      chat_template_kwargs: { enable_thinking: false },
+    });
+    expect(
+      JSON.parse(
+        (fetcher.mock.calls[1] as unknown as [string, { body: string }])[1]
+          .body,
+      ).chat_template_kwargs,
+    ).toEqual({ enable_thinking: false });
+  });
   it('counts tools and output on the actual payload and carries abort signal', async () => {
     const { g, create, fetcher } = setup();
     await g.generateContent(
