@@ -4,414 +4,386 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import OpenAI from 'openai';
-import type { 
-  GenerateContentParameters, 
-  GenerateContentResponse, 
-  CountTokensParameters, 
-  CountTokensResponse,
-  EmbedContentParameters,
-  EmbedContentResponse
+import { createHash } from 'node:crypto';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import {
+  FinishReason,
+  type GenerateContentParameters,
+  GenerateContentResponse,
+  type CountTokensParameters,
+  type CountTokensResponse,
+  type EmbedContentParameters,
+  type EmbedContentResponse,
+  type Part,
 } from '@google/genai';
 import type { ContentGenerator } from './contentGenerator.js';
 import type { UserTierId } from '../code_assist/types.js';
 import type { LlmRole } from '../telemetry/llmRole.js';
 
+type Wire = Record<string, unknown>;
+const digest = (v: unknown) =>
+  createHash('sha256').update(JSON.stringify(v)).digest('hex');
+function integer(name: string, fallback: number): number {
+  const n = Number(process.env[name] ?? fallback);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new Error(`Invalid ${name}`);
+  return n;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function textParts(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(textParts).join('\n');
+  if (isRecord(value)) {
+    const item = value;
+    if (item['parts'] !== undefined) return textParts(item['parts']);
+    const text = item['text'];
+    if (typeof text === 'string') return text;
+  }
+  throw new Error('Unsupported non-text local-model content');
+}
+
+/** A translation layer only: every tool goes through the ordinary CLI scheduler.
+ * No adapter-side shell, Python, search execution, recursion or invisible retries.
+ * /tokenize must apply the SAME served chat template (including tools) as inference.
+ */
 export class OpenAiContentGenerator implements ContentGenerator {
-  private openai: OpenAI;
-  private baseUrl: string;
-  private modelMap: Record<string, string> = {};
-  private modelListFetched = false;
+  private readonly openai: OpenAI;
+  private readonly baseUrl: string;
+  private readonly timeout = integer('LOCAL_LLM_TIMEOUT_MS', 45000);
   userTier?: UserTierId;
   userTierName?: string;
-
   constructor(baseUrl: string, apiKey?: string) {
-    this.baseUrl = baseUrl;
-    const opts: any = {
-      baseURL: baseUrl,
-      timeout: 1200000, // Explicitly set generous timeout to accommodate recursive tool execution loops
-      maxRetries: 3,
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.openai = new OpenAI({
+      baseURL: this.baseUrl,
+      apiKey: apiKey || 'local-no-secret',
+      timeout: this.timeout,
+      maxRetries: 0,
+    });
+  }
+  private signal(signal?: AbortSignal): AbortSignal {
+    const deadline = Number(process.env['LOCAL_LLM_DEADLINE_MS'] ?? Infinity);
+    const remaining = Math.min(this.timeout, deadline - Date.now());
+    if (!(remaining > 0)) throw new Error('LOCAL_DEADLINE_EXPIRED');
+    const timeout = AbortSignal.timeout(Math.ceil(remaining));
+    return signal ? AbortSignal.any([signal, timeout]) : timeout;
+  }
+  private async metadata(
+    signal: AbortSignal,
+  ): Promise<{ id: string; capacity: number }> {
+    const response = await fetch(this.baseUrl + '/models', { signal });
+    if (!response.ok) throw new Error(`Model metadata HTTP ${response.status}`);
+    const body: unknown = await response.json();
+    const models: unknown = Array.isArray(body)
+      ? body
+      : isRecord(body)
+        ? (body['data'] ?? body['models'])
+        : undefined;
+    const pin = process.env['LOCAL_LLM_MODEL'];
+    if (!pin || !Array.isArray(models))
+      throw new Error('Verified LOCAL_LLM_MODEL required');
+    const model: unknown = models.find(
+      (m: unknown) => isRecord(m) && m['id'] === pin,
+    );
+    const capacity = Number(
+      isRecord(model) ? model['max_model_len'] : undefined,
+    );
+    if (!model || !Number.isSafeInteger(capacity) || capacity <= 0)
+      throw new Error('Verified served context capacity unavailable');
+    return {
+      id: pin,
+      capacity: Math.min(capacity, integer('LOCAL_LLM_CONTEXT_CAP', 32768)),
     };
-    // Only supply an apiKey to the OpenAI client when one is explicitly provided.
-    // Avoid sending a bogus/default key which some backends treat as an invalid API key.
-    if (apiKey) {
-      opts.apiKey = apiKey;
-    }
-    this.openai = new OpenAI(opts);
   }
-
-  private async fetchModelList(): Promise<void> {
-    if (this.modelListFetched) return;
-    this.modelListFetched = true;
-    try {
-      const url = (this.baseUrl || '').replace(/\/$/, '') + '/models';
-      const res = await fetch(url, { method: 'GET' } as any);
-      if (!res.ok) return;
-      const json = await res.json();
-      const models = Array.isArray(json) ? json : json?.models ?? [];
-      for (const m of models) {
-        const id = m.id || m.root || '';
-        if (!id) continue;
-        this.modelMap[id] = id;
-        const parts = id.split('/');
-        const short = parts[parts.length - 1];
-        if (short) this.modelMap[short] = id;
-        if (m.root) {
-          const rootBase = String(m.root).split('/').pop();
-          if (rootBase) this.modelMap[rootBase] = id;
-          this.modelMap[m.root] = id;
-        }
-      }
-    } catch (e) {
-      // ignore errors, leave modelMap empty
-    }
+  private audit(record: Wire): void {
+    // Metadata only: never store prompt, results, keys or raw provider errors.
+    const path = process.env['LOCAL_LLM_AUDIT_FILE'];
+    if (!path) return;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    appendFileSync(
+      path,
+      JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+      { mode: 0o600 },
+    );
   }
-
-  private async resolveModelName(name?: string): Promise<string | undefined> {
-    if (!name) return undefined;
-    await this.fetchModelList();
-    return this.modelMap[name] ?? name;
+  private async measure(payload: Wire, signal: AbortSignal): Promise<number> {
+    const url =
+      process.env['LOCAL_LLM_TOKENIZE_URL'] ??
+      this.baseUrl.replace(/\/v1$/, '') + '/tokenize';
+    const response = await fetch(url, {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: payload['model'],
+        messages: payload['messages'],
+        tools: payload['tools'],
+        add_generation_prompt: true,
+      }),
+    });
+    if (!response.ok) throw new Error(`Tokenizer HTTP ${response.status}`);
+    const body: unknown = await response.json();
+    const count = isRecord(body) ? body['count'] : undefined;
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count <= 0)
+      throw new Error('Verified token count unavailable');
+    return count;
   }
-
   async generateContent(
     request: GenerateContentParameters,
-    userPromptId: string,
-    role: LlmRole,
+    _userPromptId: string,
+    _role: LlmRole,
   ): Promise<GenerateContentResponse> {
-    const tools = this.scrubAndMapTools(request);
-    const resolvedModel = await this.resolveModelName(request.model || 'gemma-4-26b');
-    const payload: any = {
-      model: resolvedModel,
+    const signal = this.signal(request.config?.abortSignal);
+    const model = await this.metadata(signal);
+    // Pin ALL helper routes to the qualified model, not Gemini utility defaults.
+    const output = Math.min(
+      request.config?.maxOutputTokens ?? 2048,
+      integer('LOCAL_LLM_MAX_OUTPUT', 2048),
+    );
+    if (!Number.isSafeInteger(output) || output <= 0)
+      throw new Error('Invalid output budget');
+    const payload: Wire = {
+      model: model.id,
       messages: this.mapGeminiToOpenAI(request),
-      temperature: request.config?.temperature,
-      max_tokens: request.config?.maxOutputTokens, // Let the backend `--max-model-len` constraint handle bounds
+      temperature: request.config?.temperature ?? 0,
+      max_tokens: output,
     };
-
-    if (tools) {
-      payload.tools = tools;
-      payload.extra_body = {
-        chat_template_kwargs: {
-          enable_thinking: true
-        }
-      };
-    }
-
-    let response; try { response = await this.openai.chat.completions.create(payload, { timeout: 1200000 }); } catch (e: any) { require("fs").appendFileSync("/tmp/req_tools.log", "\n\nERROR: " + e.message); throw e; }
-    
-    if (response.choices[0].message.tool_calls) {
-      return this.executeToolCall(request, response.choices[0].message, userPromptId, role);
-    }
-    
-    require('fs').appendFileSync('/tmp/debug_resp.json', '\n\n' + JSON.stringify(response, null, 2)); return this.mapOpenAIToGemini(response);
+    const tools = this.scrubAndMapTools(request);
+    if (tools) payload['tools'] = tools;
+    if (request.config?.responseMimeType === 'application/json')
+      payload['response_format'] = { type: 'json_object' };
+    if (Buffer.byteLength(JSON.stringify(payload)) > 1048576)
+      throw new Error('LOCAL_INPUT_BYTES_EXCEEDED');
+    const input = await this.measure(payload, signal);
+    const safety = integer('LOCAL_LLM_CONTEXT_SAFETY', 512);
+    const projected = input + output + safety;
+    const decision =
+      projected > 0.7 * model.capacity
+        ? 'REJECT'
+        : projected >= 0.6 * model.capacity
+          ? 'ROTATE'
+          : 'ADMIT';
+    this.audit({
+      model: model.id,
+      capacity: model.capacity,
+      input,
+      output,
+      safety,
+      decision,
+      request_digest: digest(payload),
+    });
+    if (decision !== 'ADMIT') throw new Error(`LOCAL_CONTEXT_${decision}`);
+    const response = await this.openai.chat.completions.create(
+      // Wire is constructed above from text messages and validated function declarations.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      payload as unknown as OpenAI.ChatCompletionCreateParamsNonStreaming,
+      { signal, timeout: this.timeout },
+    );
+    if (response.model !== model.id)
+      throw new Error('Served model identity changed');
+    if (response.usage && response.usage.prompt_tokens > input + safety)
+      throw new Error('Provider token accounting discrepancy');
+    this.audit({
+      model: response.model,
+      response_digest: digest(response),
+      usage: response.usage,
+    });
+    return this.mapOpenAIToGemini(response);
   }
-
-      async generateContentStream(
+  async generateContentStream(
     request: GenerateContentParameters,
     userPromptId: string,
     role: LlmRole,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
-    const self = this;
-    async function* generator() {
-      const response = await self.generateContent(request, userPromptId, role);
+    const response = await this.generateContent(request, userPromptId, role);
+    return (async function* () {
       yield response;
-    }
-    return generator();
+    })();
   }
-
-  async countTokens(request: CountTokensParameters): Promise<CountTokensResponse> {
-    return { totalTokens: 0 };
-  }
-
-  async embedContent(request: EmbedContentParameters): Promise<EmbedContentResponse> {
-    return { embeddings: [] };
-  }
-
-  private scrubAndMapTools(req: any): any[] | undefined {
-    require('fs').appendFileSync('/tmp/req_tools.log', JSON.stringify(req, null, 2) + '\n');
-    if (process.env['GEMINI_DISABLE_TOOLS'] === "true") {
-      return undefined;
-    }
-    const outTools: any[] = [];
-    const seenToolNames = new Set<string>();
-    const inTools = req.tools || (req.config && req.config.tools) || [];
-
-    const addTool = (name: string, description: string, parameters: any) => {
-      if (!name || seenToolNames.has(name)) {
-        return;
-      }
-      seenToolNames.add(name);
-      outTools.push({
-        type: "function",
-        function: {
-          name,
-          description: description || "",
-          parameters: parameters || { type: "object", properties: {} }
-        }
-      });
+  async countTokens(
+    request: CountTokensParameters,
+  ): Promise<CountTokensResponse> {
+    const signal = this.signal();
+    const model = await this.metadata(signal);
+    return {
+      totalTokens: await this.measure(
+        {
+          model: model.id,
+          messages: this.mapGeminiToOpenAI(
+            request as GenerateContentParameters,
+          ),
+          tools: this.scrubAndMapTools(request),
+        },
+        signal,
+      ),
     };
-
-    if (Array.isArray(inTools)) {
-      for (const tool of inTools) {
-        if (tool.functionDeclarations) {
-          for (const func of tool.functionDeclarations) {
-            addTool(
-              func.name,
-              func.description || "",
-              func.parametersJsonSchema || func.parameters || { type: "object", properties: {} },
-            );
-          }
-        }
-
-        if (tool.googleSearch !== undefined) {
-          addTool(
-            "google_web_search",
-            "Search the web for real-time information. Returns a JSON string of search results.",
-            {
-              type: "object",
-              properties: {
-                query: { type: "string", description: "The search query" }
-              },
-              required: ["query"]
-            },
-          );
-        }
-
-        if (tool.codeExecution !== undefined) {
-          addTool(
-            "execute_python_code",
-            "Execute python code generated by the model. Returns execution output.",
-            {
-              type: "object",
-              properties: {
-                code: { type: "string", description: "The python code to execute" }
-              },
-              required: ["code"]
-            },
-          );
-        }
-      }
-    }
-
-    return outTools.length > 0 ? outTools : undefined;
   }
-  
-  private async interceptFunctionCall(req: any, call: any): Promise<any> {
-    const fs = require('node:fs');
-    const { execSync } = require('node:child_process');
-    const os = require('node:os');
-    
-    if (call.name === 'tavily_search' || call.name === 'googleSearch' || call.name === 'google_web_search') {
-      const args = JSON.parse(call.arguments);
-      const query = args.query;
-      
-      const quotaFile = os.homedir() + '/.gemini_cli_tavily_quota.json';
-      let quota = { searches: 0 };
-      if (fs.existsSync(quotaFile)) {
-        try { quota = JSON.parse(fs.readFileSync(quotaFile, 'utf8')); } catch (e) {}
-      }
-      
-      if (quota.searches >= 1000) {
-        return JSON.stringify({ error: "Tavily search quota exceeded for this month." });
-      }
-      quota.searches += 1;
-      fs.writeFileSync(quotaFile, JSON.stringify(quota));
-      
-      try {
-        const resp = await fetch('https://api.tavily.com/search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            api_key: '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',
-            query,
-            search_depth: "basic",
-            include_answer: false,
-            max_results: 3
-          })
+  async embedContent(
+    _request: EmbedContentParameters,
+  ): Promise<EmbedContentResponse> {
+    throw new Error('Local embeddings are not qualified');
+  }
+  private scrubAndMapTools(req: unknown): Wire[] | undefined {
+    if (process.env['GEMINI_DISABLE_TOOLS'] === 'true') return undefined;
+    if (!isRecord(req)) throw new Error('Invalid request');
+    const config = req['config'];
+    const inputTools =
+      (isRecord(config) ? config['tools'] : undefined) ?? req['tools'] ?? [];
+    if (!Array.isArray(inputTools)) throw new Error('Invalid tools');
+    const result: Wire[] = [];
+    const seen = new Set<string>();
+    for (const rawTool of inputTools) {
+      const tool: unknown = rawTool;
+      if (!isRecord(tool)) throw new Error('Invalid tool schema');
+      // Provider-native tools cannot bypass scheduler policy. Search is handled
+      // inside the registered web-search tool; Python uses ordinary shell policy.
+      if (
+        tool['googleSearch'] !== undefined ||
+        tool['codeExecution'] !== undefined
+      )
+        throw new Error(
+          'Native provider tool disabled; use a registered scheduler tool',
+        );
+      const declarations = tool['functionDeclarations'] ?? [];
+      if (!Array.isArray(declarations)) throw new Error('Invalid declarations');
+      for (const rawFunction of declarations) {
+        const fn: unknown = rawFunction;
+        if (!isRecord(fn)) throw new Error('Invalid function schema');
+        const name = String(fn['name']);
+        if (
+          [
+            'ask_user',
+            'invoke_agent',
+            'activate_skill',
+            'execute_python_code',
+            'codeExecution',
+          ].includes(name)
+        )
+          continue;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        result.push({
+          type: 'function',
+          function: {
+            name,
+            description: fn['description'] ?? '',
+            parameters: fn['parametersJsonSchema'] ??
+              fn['parameters'] ?? { type: 'object', properties: {} },
+          },
         });
-        const data = await resp.json();
-        return JSON.stringify(data);
-      } catch (err: any) {
-        return JSON.stringify({ error: err.message });
-      }
-    } 
-    else if (call.name === 'execute_python_code' || call.name === 'codeExecution') {
-      const args = JSON.parse(call.arguments);
-      try {
-                const tmpFile = require('os').tmpdir() + '/gemini_cli_exec_' + Date.now() + '.py';
-        fs.writeFileSync(tmpFile, args.code);
-        const out = execSync(`python3 ${tmpFile}`, { encoding: 'utf8', stdio: 'pipe' });
-        fs.unlinkSync(tmpFile);
-        return JSON.stringify({ output: out });
-      } catch (err: any) {
-        return JSON.stringify({ error: err.message, stderr: err.stderr });
       }
     }
-    
-    return JSON.stringify({ error: "Unsupported tool call" });
+    return result.length ? result : undefined;
   }
-
-  private async executeToolCall(req: GenerateContentParameters, responseMessage: any, userPromptId: string, role: string, previousMessages?: any[], depth: number = 0): Promise<GenerateContentResponse> {
-    if (depth >= 15) {
-      return this.mapOpenAIToGemini({
-        choices: [{
-          message: { content: "I've reached the maximum number of tool execution steps." },
-          finish_reason: "length"
-        }],
-        usage: {}
-      });
+  private mapGeminiToOpenAI(req: GenerateContentParameters): Wire[] {
+    const messages: Wire[] = [];
+    const protectedFile = process.env['LOCAL_LLM_PROTECTED_FILE'];
+    if (protectedFile) {
+      const protectedText = readFileSync(protectedFile, 'utf8');
+      if (!protectedText.trim() || Buffer.byteLength(protectedText) > 32768)
+        throw new Error('Invalid protected instruction block');
+      messages.push({ role: 'system', content: protectedText });
     }
-
-    require('fs').appendFileSync('/tmp/tool_calls.log', JSON.stringify(responseMessage, null, 2) + '\n');
-    
-    // Check if tool is internal to proxy
-    let hasInternalTools = false;
-    let hasExternalTools = false;
-    
-    if (responseMessage.tool_calls) {
-      for (const call of responseMessage.tool_calls) {
-        if (['tavily_search', 'execute_python_code', 'googleSearch', 'google_web_search', 'codeExecution'].includes(call.function.name)) {
-          hasInternalTools = true;
-        } else {
-          hasExternalTools = true;
-        }
+    const system =
+      req.config?.systemInstruction ??
+      ('systemInstruction' in req ? req.systemInstruction : undefined);
+    if (system !== undefined)
+      messages.push({ role: 'system', content: textParts(system) });
+    const input = Array.isArray(req.contents) ? req.contents : [req.contents];
+    const pending = new Map<string, string>();
+    for (const content of input) {
+      if (typeof content === 'string') {
+        messages.push({ role: 'user', content });
+        continue;
       }
-    }
-    
-    // If it only has external tools, just return them to the CLI!
-    if (hasExternalTools && !hasInternalTools) {
-       return this.mapOpenAIToGemini({ choices: [{ message: responseMessage, finish_reason: "tool_calls" }] });
-    }
-
-    const messages = previousMessages || this.mapGeminiToOpenAI(req);
-    messages.push(responseMessage);
-
-    if (responseMessage.tool_calls) {
-      for (const call of responseMessage.tool_calls) {
-        const callId = call.id;
-        const callResult = await this.interceptFunctionCall(req, call.function);
+      if (!content) continue;
+      const c = content as { role?: string; parts?: Part[]; text?: string };
+      const parts = c.parts ?? (c.text !== undefined ? [{ text: c.text }] : []);
+      const calls: Wire[] = [];
+      const texts: string[] = [];
+      for (const part of parts) {
+        if (part.functionCall) {
+          const f = part.functionCall;
+          if (!f.id || !f.name || pending.has(f.id))
+            throw new Error('Missing or duplicate tool identity');
+          pending.set(f.id, f.name);
+          calls.push({
+            id: f.id,
+            type: 'function',
+            function: { name: f.name, arguments: JSON.stringify(f.args ?? {}) },
+          });
+        } else if (part.functionResponse) {
+          const f = part.functionResponse;
+          if (!f.id || pending.get(f.id) !== f.name)
+            throw new Error('Unmatched tool response identity');
+          pending.delete(f.id);
+          messages.push({
+            role: 'tool',
+            tool_call_id: f.id,
+            content: JSON.stringify(f.response),
+          });
+        } else if (part.text !== undefined) texts.push(part.text);
+        else throw new Error('Unqualified multimodal local-model input');
+      }
+      if (texts.length || calls.length)
         messages.push({
-          role: "tool",
-          tool_call_id: callId,
-          name: call.function.name,
-          content: callResult
+          role: c.role === 'model' ? 'assistant' : 'user',
+          content: texts.join('\n') || null,
+          ...(calls.length ? { tool_calls: calls } : {}),
         });
-      }
     }
-    
-    const tools = this.scrubAndMapTools(req);
-    const resolvedModel = await this.resolveModelName(req.model || 'gemma-4-26b');
-    const payload: any = {
-      model: resolvedModel,
-      messages
-    };
-
-    if (tools) {
-      payload.tools = tools;
-      payload.extra_body = {
-        chat_template_kwargs: {
-          enable_thinking: true
-        }
-      };
-    }
-    
-    let response; try { response = await this.openai.chat.completions.create(payload, { timeout: 1200000 }); } catch (e: any) { require("fs").appendFileSync("/tmp/req_tools.log", "\n\nERROR INNER: " + e.message); throw e; }
-    
-    if (response.choices[0].message.tool_calls) {
-      return await this.executeToolCall(req, response.choices[0].message, userPromptId, role, messages, depth + 1);
-    }
-    
-    return this.mapOpenAIToGemini(response);
-  }
-
-    private mapGeminiToOpenAI(req: GenerateContentParameters): any[] {
-    const messages: any[] = [];
-    const anyReq = req as any;
-    if (anyReq.systemInstruction?.parts) {
-      messages.push({ role: 'system', content: anyReq.systemInstruction.parts.map((p: any) => p.text).join('\n') });
-    }
-    const contentsArray = Array.isArray(req.contents) ? req.contents : (req.contents ? [req.contents] : []);
-    for (const c of contentsArray) {
-      const anyC = c as any;
-      const parts = Array.isArray(anyC.parts) ? anyC.parts : [];
-      
-      const fnResponses = parts.filter((p: any) => !!p.functionResponse);
-      const fnCalls = parts.filter((p: any) => !!p.functionCall);
-      const textParts = parts.filter((p: any) => p.text).map((p: any) => p.text).join('\n');
-      
-      if (fnResponses.length > 0) {
-        for (const p of fnResponses) {
-           messages.push({
-             role: 'tool',
-             tool_call_id: p.functionResponse.id || (p.functionResponse.name + "_id"),
-             name: p.functionResponse.name,
-             content: typeof p.functionResponse.response === 'string' ? p.functionResponse.response : JSON.stringify(p.functionResponse.response)
-           });
-        }
-      } 
-      
-      if (textParts || fnCalls.length > 0) {
-        let msg: any = {
-          role: anyC.role === 'model' ? 'assistant' : 'user',
-        };
-        if (textParts) msg.content = textParts;
-        
-        if (fnCalls.length > 0) {
-          msg.tool_calls = fnCalls.map((p: any) => ({
-            id: p.functionCall.id || (p.functionCall.name + "_id"),
-            type: "function",
-            function: {
-               name: p.functionCall.name,
-               arguments: typeof p.functionCall.args === 'string' ? p.functionCall.args : JSON.stringify(p.functionCall.args)
-            }
-          }));
-        }
-        messages.push(msg);
-      }
-    }
+    if (pending.size)
+      throw new Error('Unresolved tool calls before model request');
     return messages;
   }
-
-  private mapOpenAIToGemini(resp: any): GenerateContentResponse {
-    const message = resp.choices[0].message;
-    const parts: any[] = [];
-    if (message.content) {
-      parts.push({ text: message.content });
+  private mapOpenAIToGemini(
+    response: OpenAI.ChatCompletion,
+  ): GenerateContentResponse {
+    const choice = response.choices[0];
+    if (!choice) throw new Error('Missing completion choice');
+    const parts: Part[] = [];
+    if (choice.message.content) parts.push({ text: choice.message.content });
+    const ids = new Set<string>();
+    for (const call of choice.message.tool_calls ?? []) {
+      if (call.type !== 'function' || !call.id || ids.has(call.id))
+        throw new Error('Invalid backend tool identity');
+      ids.add(call.id);
+      const args: unknown = JSON.parse(call.function.arguments || '{}');
+      if (!isRecord(args)) throw new Error('Invalid tool arguments');
+      if (
+        [
+          'ask_user',
+          'invoke_agent',
+          'activate_skill',
+          'execute_python_code',
+          'codeExecution',
+        ].includes(call.function.name)
+      )
+        throw new Error('Noninteractive policy denied tool');
+      parts.push({
+        functionCall: { id: call.id, name: call.function.name, args },
+      });
     }
-    if (message.tool_calls) {
-      for (const call of message.tool_calls) {
-        parts.push({
-          functionCall: {
-            name: call.function.name,
-            args: call.function.arguments ? JSON.parse(call.function.arguments) : {}
-          }
-        });
-      }
-    }
-    // ensure at least empty text if no parts to avoid validation errors
-    if (parts.length === 0) {
-      parts.push({ text: "" });
-    }
-    
-    
-    const mappedResp = {
-      candidates: [{
-        content: { parts: parts, role: 'model' },
-        finishReason: parts.some(p => p.functionCall) ? undefined : (resp.choices[0].finish_reason === "tool_calls" ? "STOP" : resp.choices[0].finish_reason)
-      }],
-      functionCalls: parts.filter(p => p.functionCall).map(p => {
-        const fc = p.functionCall;
-        return {
-           id: "synth_mapped_" + Date.now() + "_" + Math.random().toString(36).substr(2, 5),
-           name: fc.name,
-           args: fc.args
-        };
-      }),
+    if (!parts.length) parts.push({ text: '' });
+    const mapped = new GenerateContentResponse();
+    Object.assign(mapped, {
+      candidates: [
+        {
+          content: { parts, role: 'model' },
+          finishReason:
+            choice.finish_reason === 'length'
+              ? FinishReason.MAX_TOKENS
+              : FinishReason.STOP,
+        },
+      ],
       usageMetadata: {
-        promptTokenCount: resp.usage?.prompt_tokens,
-        candidatesTokenCount: resp.usage?.completion_tokens,
-        totalTokenCount: resp.usage?.total_tokens
-      }
-    };
-    require('fs').appendFileSync('/tmp/gemini_mapped_response.log', JSON.stringify(mappedResp, null, 2) + '\n');
-    return mappedResp as GenerateContentResponse;
+        promptTokenCount: response.usage?.prompt_tokens,
+        candidatesTokenCount: response.usage?.completion_tokens,
+        totalTokenCount: response.usage?.total_tokens,
+      },
+    });
+    return mapped;
   }
 }

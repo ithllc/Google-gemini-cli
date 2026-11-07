@@ -153,6 +153,11 @@ export async function createContentGeneratorConfig(
     return contentGeneratorConfig;
   }
 
+  if (authType === AuthType.USE_OPENAI_COMPATIBLE) {
+    contentGeneratorConfig.apiKey = apiKey || process.env['LOCAL_LLM_API_KEY'];
+    return contentGeneratorConfig;
+  }
+
   const geminiApiKey =
     apiKey ||
     process.env['GEMINI_API_KEY'] ||
@@ -199,7 +204,8 @@ export async function createContentGenerator(
 ): Promise<ContentGenerator> {
   const generator = await (async () => {
     if (config.authType === AuthType.USE_OPENAI_COMPATIBLE) {
-      const baseUrl = process.env['LOCAL_LLM_BASE_URL'] || 'http://192.168.1.168:4000/v1';
+      const baseUrl =
+        process.env['LOCAL_LLM_BASE_URL'] || 'http://192.168.1.168:4000/v1';
       return new OpenAiContentGenerator(baseUrl, config.apiKey || 'dummy');
     }
     if (gcConfig.fakeResponses) {

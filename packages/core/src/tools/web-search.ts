@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { localWebSearch } from './local-web-search.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
 import { WEB_SEARCH_TOOL_NAME, WEB_SEARCH_DISPLAY_NAME } from './tool-names.js';
 import type { GroundingMetadata } from '@google/genai';
@@ -88,6 +89,13 @@ class WebSearchToolInvocation extends BaseToolInvocation<
   async execute({
     abortSignal: signal,
   }: ExecuteOptions): Promise<WebSearchToolResult> {
+    if (process.env['LOCAL_LLM_BASE_URL']) {
+      const result = await localWebSearch(this.params.query, signal);
+      return {
+        llmContent: result,
+        returnDisplay: 'Tavily search completed with source URLs.',
+      };
+    }
     const geminiClient = this.context.geminiClient;
 
     try {
