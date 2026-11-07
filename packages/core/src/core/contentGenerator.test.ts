@@ -46,6 +46,16 @@ describe('createContentGenerator', () => {
     vi.unstubAllEnvs();
   });
 
+  it('does not open an interactive Google credential store for local inference', async () => {
+    vi.stubEnv('LOCAL_LLM_API_KEY', 'local-placeholder');
+    const result = await createContentGeneratorConfig(
+      mockConfig,
+      AuthType.USE_OPENAI_COMPATIBLE,
+    );
+    expect(result.apiKey).toBe('local-placeholder');
+    expect(loadApiKey).not.toHaveBeenCalled();
+  });
+
   it('should create a FakeContentGenerator', async () => {
     const mockGenerator = {} as unknown as ContentGenerator;
     vi.mocked(FakeContentGenerator.fromFile).mockResolvedValue(
