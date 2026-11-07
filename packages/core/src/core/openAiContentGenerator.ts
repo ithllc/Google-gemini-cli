@@ -120,6 +120,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
         model: payload['model'],
         messages: payload['messages'],
         tools: payload['tools'],
+        chat_template_kwargs: payload['chat_template_kwargs'],
         add_generation_prompt: true,
       }),
     });
@@ -150,6 +151,8 @@ export class OpenAiContentGenerator implements ContentGenerator {
       temperature: request.config?.temperature ?? 0,
       max_tokens: output,
     };
+    if (process.env['LOCAL_LLM_DISABLE_THINKING'] === 'true')
+      payload['chat_template_kwargs'] = { enable_thinking: false };
     const tools = this.scrubAndMapTools(request);
     if (tools) payload['tools'] = tools;
     if (request.config?.responseMimeType === 'application/json')
@@ -215,6 +218,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
             request as GenerateContentParameters,
           ),
           tools: this.scrubAndMapTools(request),
+          ...(process.env['LOCAL_LLM_DISABLE_THINKING'] === 'true'
+            ? { chat_template_kwargs: { enable_thinking: false } }
+            : {}),
         },
         signal,
       ),

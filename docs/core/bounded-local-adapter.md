@@ -44,3 +44,7 @@ These controls do not grant production authority. The consuming trading project
 tracks isolation, scheduling, SQL state, independent testing and direct
 publication in
 [issue252](https://github.com/ithllc/DaySchwabOrderManagement/issues/252).
+
+`LOCAL_LLM_DISABLE_THINKING=true` selects a bounded nonthinking template when
+qualified by the serving backend. The identical `chat_template_kwargs` is sent
+to tokenization and generation; this never changes output/context limits.
