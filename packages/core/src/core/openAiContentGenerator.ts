@@ -140,7 +140,7 @@ export class OpenAiContentGenerator implements ContentGenerator {
     const model = await this.metadata(signal);
     // Pin ALL helper routes to the qualified model, not Gemini utility defaults.
     const output = Math.min(
-      request.config?.maxOutputTokens ?? 2048,
+      request.config?.maxOutputTokens ?? integer('LOCAL_LLM_MAX_OUTPUT', 2048),
       integer('LOCAL_LLM_MAX_OUTPUT', 2048),
     );
     if (!Number.isSafeInteger(output) || output <= 0)
@@ -151,8 +151,11 @@ export class OpenAiContentGenerator implements ContentGenerator {
       temperature: request.config?.temperature ?? 0,
       max_tokens: output,
     };
-    if (process.env['LOCAL_LLM_DISABLE_THINKING'] === 'true')
-      payload['chat_template_kwargs'] = { enable_thinking: false };
+    const thinking = process.env['LOCAL_LLM_DISABLE_THINKING'];
+    if (thinking === 'true' || thinking === 'false')
+      payload['chat_template_kwargs'] = {
+        enable_thinking: thinking === 'false',
+      };
     const tools = this.scrubAndMapTools(request);
     if (tools) payload['tools'] = tools;
     if (request.config?.responseMimeType === 'application/json')
@@ -218,8 +221,15 @@ export class OpenAiContentGenerator implements ContentGenerator {
             request as GenerateContentParameters,
           ),
           tools: this.scrubAndMapTools(request),
-          ...(process.env['LOCAL_LLM_DISABLE_THINKING'] === 'true'
-            ? { chat_template_kwargs: { enable_thinking: false } }
+          ...(['true', 'false'].includes(
+            process.env['LOCAL_LLM_DISABLE_THINKING'] ?? '',
+          )
+            ? {
+                chat_template_kwargs: {
+                  enable_thinking:
+                    process.env['LOCAL_LLM_DISABLE_THINKING'] === 'false',
+                },
+              }
             : {}),
         },
         signal,

@@ -154,6 +154,36 @@ describe('bounded local adapter', () => {
       ).chat_template_kwargs,
     ).toEqual({ enable_thinking: false });
   });
+  it('uses the configured allowance when the request has no explicit limit', async () => {
+    const { g, create } = setup();
+    vi.stubEnv('LOCAL_LLM_MAX_OUTPUT', '4096');
+    await g.generateContent({ model, contents: 'task' }, 'p', LlmRole.MAIN);
+    expect(create.mock.calls[0][0]).toMatchObject({ max_tokens: 4096 });
+  });
+  it('retains a smaller explicit request limit', async () => {
+    const { g, create } = setup();
+    vi.stubEnv('LOCAL_LLM_MAX_OUTPUT', '4096');
+    await g.generateContent(
+      { model, contents: 'task', config: { maxOutputTokens: 512 } },
+      'p',
+      LlmRole.MAIN,
+    );
+    expect(create.mock.calls[0][0]).toMatchObject({ max_tokens: 512 });
+  });
+  it('explicit thinking mode is identical for token measurement and completion', async () => {
+    const { g, create, fetcher } = setup();
+    vi.stubEnv('LOCAL_LLM_DISABLE_THINKING', 'false');
+    await g.generateContent({ model, contents: 'task' }, 'p', LlmRole.MAIN);
+    expect(create.mock.calls[0][0]).toMatchObject({
+      chat_template_kwargs: { enable_thinking: true },
+    });
+    expect(
+      JSON.parse(
+        (fetcher.mock.calls[1] as unknown as [string, { body: string }])[1]
+          .body,
+      ).chat_template_kwargs,
+    ).toEqual({ enable_thinking: true });
+  });
   it('counts tools and output on the actual payload and carries abort signal', async () => {
     const { g, create, fetcher } = setup();
     await g.generateContent(
