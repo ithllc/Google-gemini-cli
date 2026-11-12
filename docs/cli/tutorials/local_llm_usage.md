@@ -156,4 +156,3 @@ output, reasoning and context controls continue to apply. The remote policy is a
 per-process setting; do not enable it for the local Gemma worker. An unknown
 policy value is rejected. This changes generation settings only and grants no
 repair, spending, deployment or tool permissions.
-
