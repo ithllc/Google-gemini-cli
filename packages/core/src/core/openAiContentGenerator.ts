@@ -52,9 +52,14 @@ export class OpenAiContentGenerator implements ContentGenerator {
   private readonly openai: OpenAI;
   private readonly baseUrl: string;
   private readonly timeout = integer('LOCAL_LLM_TIMEOUT_MS', 45000);
+  private readonly vendorDefaults: boolean;
   userTier?: UserTierId;
   userTierName?: string;
   constructor(baseUrl: string, apiKey?: string) {
+    const policy = process.env['LLM_GENERATION_POLICY'] ?? 'local_bounded_v1';
+    if (!['local_bounded_v1', 'vendor_defaults_v1'].includes(policy))
+      throw new Error('Unknown LLM_GENERATION_POLICY');
+    this.vendorDefaults = policy === 'vendor_defaults_v1';
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.openai = new OpenAI({
       baseURL: this.baseUrl,
@@ -94,7 +99,9 @@ export class OpenAiContentGenerator implements ContentGenerator {
       throw new Error('Verified served context capacity unavailable');
     return {
       id: pin,
-      capacity: Math.min(capacity, integer('LOCAL_LLM_CONTEXT_CAP', 32768)),
+      capacity: this.vendorDefaults
+        ? capacity
+        : Math.min(capacity, integer('LOCAL_LLM_CONTEXT_CAP', 32768)),
     };
   }
   private audit(record: Wire): void {
@@ -139,20 +146,32 @@ export class OpenAiContentGenerator implements ContentGenerator {
     const signal = this.signal(request.config?.abortSignal);
     const model = await this.metadata(signal);
     // Pin ALL helper routes to the qualified model, not Gemini utility defaults.
-    const output = Math.min(
-      request.config?.maxOutputTokens ?? integer('LOCAL_LLM_MAX_OUTPUT', 2048),
-      integer('LOCAL_LLM_MAX_OUTPUT', 2048),
-    );
-    if (!Number.isSafeInteger(output) || output <= 0)
+    const output = this.vendorDefaults
+      ? undefined
+      : Math.min(
+          request.config?.maxOutputTokens ??
+            integer('LOCAL_LLM_MAX_OUTPUT', 2048),
+          integer('LOCAL_LLM_MAX_OUTPUT', 2048),
+        );
+    if (
+      !this.vendorDefaults &&
+      (typeof output !== 'number' ||
+        !Number.isSafeInteger(output) ||
+        output <= 0)
+    )
       throw new Error('Invalid output budget');
     const payload: Wire = {
       model: model.id,
       messages: this.mapGeminiToOpenAI(request),
-      temperature: request.config?.temperature ?? 0,
-      max_tokens: output,
+      ...(!this.vendorDefaults
+        ? {
+            temperature: request.config?.temperature ?? 0,
+            max_tokens: output,
+          }
+        : {}),
     };
     const thinking = process.env['LOCAL_LLM_DISABLE_THINKING'];
-    if (thinking === 'true' || thinking === 'false')
+    if (!this.vendorDefaults && (thinking === 'true' || thinking === 'false'))
       payload['chat_template_kwargs'] = {
         enable_thinking: thinking === 'false',
       };
@@ -163,10 +182,15 @@ export class OpenAiContentGenerator implements ContentGenerator {
     if (Buffer.byteLength(JSON.stringify(payload)) > 1048576)
       throw new Error('LOCAL_INPUT_BYTES_EXCEEDED');
     const input = await this.measure(payload, signal);
-    const safety = integer('LOCAL_LLM_CONTEXT_SAFETY', 512);
-    const projected = input + output + safety;
-    const decision =
-      projected > 0.7 * model.capacity
+    const safety = this.vendorDefaults
+      ? 0
+      : integer('LOCAL_LLM_CONTEXT_SAFETY', 512);
+    const projected = input + (output ?? 0) + safety;
+    const decision = this.vendorDefaults
+      ? input < model.capacity
+        ? 'ADMIT'
+        : 'REJECT'
+      : projected > 0.7 * model.capacity
         ? 'REJECT'
         : projected >= 0.6 * model.capacity
           ? 'ROTATE'
@@ -178,9 +202,17 @@ export class OpenAiContentGenerator implements ContentGenerator {
       output,
       safety,
       decision,
+      output_policy: this.vendorDefaults
+        ? 'vendor_defaults_v1'
+        : 'local_bounded_v1',
       request_digest: digest(payload),
     });
-    if (decision !== 'ADMIT') throw new Error(`LOCAL_CONTEXT_${decision}`);
+    if (decision !== 'ADMIT')
+      throw new Error(
+        this.vendorDefaults
+          ? 'VENDOR_INPUT_EXCEEDS_SERVED_CONTEXT'
+          : `LOCAL_CONTEXT_${decision}`,
+      );
     const response = await this.openai.chat.completions.create(
       // Wire is constructed above from text messages and validated function declarations.
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
@@ -189,7 +221,11 @@ export class OpenAiContentGenerator implements ContentGenerator {
     );
     if (response.model !== model.id)
       throw new Error('Served model identity changed');
-    if (response.usage && response.usage.prompt_tokens > input + safety)
+    if (
+      !this.vendorDefaults &&
+      response.usage &&
+      response.usage.prompt_tokens > input + safety
+    )
       throw new Error('Provider token accounting discrepancy');
     this.audit({
       model: response.model,
@@ -221,7 +257,8 @@ export class OpenAiContentGenerator implements ContentGenerator {
             request as GenerateContentParameters,
           ),
           tools: this.scrubAndMapTools(request),
-          ...(['true', 'false'].includes(
+          ...(!this.vendorDefaults &&
+          ['true', 'false'].includes(
             process.env['LOCAL_LLM_DISABLE_THINKING'] ?? '',
           )
             ? {

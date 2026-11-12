@@ -65,6 +65,76 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe('bounded local adapter', () => {
+  it('uses vendor generation defaults without inheriting local hosting controls', async () => {
+    vi.stubEnv('LLM_GENERATION_POLICY', 'vendor_defaults_v1');
+    vi.stubEnv('LOCAL_LLM_MAX_OUTPUT', '32');
+    vi.stubEnv('LOCAL_LLM_DISABLE_THINKING', 'true');
+    const { g, create, fetcher } = setup(11000);
+    await g.generateContent(
+      {
+        model,
+        contents: 'task',
+        config: { maxOutputTokens: 12, temperature: 0.1 },
+      },
+      'p',
+      LlmRole.MAIN,
+    );
+    const payload = create.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload['max_tokens']).toBeUndefined();
+    expect(payload['temperature']).toBeUndefined();
+    expect(payload['chat_template_kwargs']).toBeUndefined();
+    const measured = JSON.parse(
+      (fetcher.mock.calls[1] as unknown as [string, { body: string }])[1].body,
+    );
+    expect(measured.chat_template_kwargs).toBeUndefined();
+    await g.countTokens({ model, contents: 'task' });
+    const counted = JSON.parse(
+      (fetcher.mock.calls.at(-1) as unknown as [string, { body: string }])[1]
+        .body,
+    );
+    expect(counted.chat_template_kwargs).toBeUndefined();
+  });
+  it('accepts vendor output beyond the local token allowance and still pins model identity', async () => {
+    vi.stubEnv('LLM_GENERATION_POLICY', 'vendor_defaults_v1');
+    vi.stubEnv('LOCAL_LLM_MAX_OUTPUT', '10');
+    const { g, create } = setup();
+    create.mockResolvedValueOnce({
+      model,
+      choices: [
+        {
+          message: { content: 'long completed solution' },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 6000,
+        total_tokens: 6100,
+      },
+    } as never);
+    const response = await g.generateContent(
+      { model, contents: 'task' },
+      'p',
+      LlmRole.MAIN,
+    );
+    expect(response.usageMetadata?.candidatesTokenCount).toBe(6000);
+    create.mockResolvedValueOnce({ model: 'other', choices: [] } as never);
+    await expect(
+      g.generateContent({ model, contents: 'task' }, 'p', LlmRole.MAIN),
+    ).rejects.toThrow('identity changed');
+  });
+  it('uses the actual vendor input capacity and rejects an unknown execution policy', async () => {
+    vi.stubEnv('LLM_GENERATION_POLICY', 'vendor_defaults_v1');
+    const { g, create } = setup(12000);
+    await expect(
+      g.generateContent({ model, contents: 'task' }, 'p', LlmRole.MAIN),
+    ).rejects.toThrow('VENDOR_INPUT_EXCEEDS_SERVED_CONTEXT');
+    expect(create).not.toHaveBeenCalled();
+    vi.stubEnv('LLM_GENERATION_POLICY', 'typo');
+    expect(
+      () => new OpenAiContentGenerator('http://localhost:1234/v1'),
+    ).toThrow('Unknown LLM_GENERATION_POLICY');
+  });
   it.each([
     'protected',
     { text: 'protected' },
