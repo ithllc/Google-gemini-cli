@@ -140,3 +140,20 @@ the runtime environment and call the absolute path sequentially:
    ```bash
    node /llm_models_python_code_src/Google-gemini-cli/bundle/gemini.js -p "Example Question or Comment to the Local LLM" --model="gemma-4-26b"
    ```
+## Vendor-hosted generation defaults
+
+For a separately qualified remote provider, set
+`LLM_GENERATION_POLICY=vendor_defaults_v1` in that CLI process. The OpenAI
+translation adapter then leaves output length, reasoning and sampling settings
+to the vendor. It does not send `max_tokens`, `temperature` or local thinking
+template overrides, and it does not apply the local 60/70-percent context
+thresholds. Input must still fit the actual served model context. Model pinning,
+the normal CLI tool scheduler, explicit tool denial and request cancellation
+remain in effect.
+
+Omitting this variable retains `local_bounded_v1`: all existing local hosting
+output, reasoning and context controls continue to apply. The remote policy is a
+per-process setting; do not enable it for the local Gemma worker. An unknown
+policy value is rejected. This changes generation settings only and grants no
+repair, spending, deployment or tool permissions.
+
